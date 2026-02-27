@@ -1,6 +1,7 @@
 # app/agents/market_analyst.py
 
 import json
+import math
 import logging
 from typing import Dict, Any, List, Tuple
 from datetime import datetime, timedelta
@@ -40,7 +41,7 @@ class MarketSentimentSchema(BaseModel):
     )
     reasoning: str = Field(
         ...,
-        description="详细逻辑分析：必须结合量价指标与全天平均情绪进行解释，不超过300字"
+        description="详细逻辑分析：必须结合量价指标、情绪均值以及【情绪离散度/分歧度】进行解释，不超过300字"
     )
 
 
@@ -170,11 +171,11 @@ class MarketPipeline:
             db.close()
 
     # ----------------------------------------------------------------
-    # [核心模块 B]: 场外定性分析 (接收小 Agent 的精标数据)
+    # [核心模块 B]: 场外定性分析 (接收小 Agent 的精标数据 + 高级数学清洗)
     # ----------------------------------------------------------------
-    def _analyze_qualitative_news(self, db: Session) -> Tuple[str, float]:
-        """【核心重构】: 只负责读取已打分的新闻并计算均值，彻底剥离打分逻辑"""
-        logger.info(">>> [NLP Engine] 从底层池提取过去 24 小时已精标的宏观新闻流...")
+    def _analyze_qualitative_news(self, db: Session) -> Tuple[str, float, float]:
+        """【核心重构】: 引入指数时间衰减 (EMA思想) 与 情绪离散度 (Dispersion) 计算"""
+        logger.info(">>> [NLP Engine] 从底层池提取过去 24 小时已精标的宏观新闻流，并计算时间衰减分与情绪离散度...")
 
         time_threshold = datetime.now() - timedelta(hours=24)
 
@@ -186,17 +187,44 @@ class MarketPipeline:
 
         if not recent_news:
             logger.warning(">>> [NLP Engine] 本地暂无已打分新闻，发送空文本让 LLM 纯靠量价研判...")
-            return "近期暂无重大新闻驱动", 5.0
+            return "近期暂无重大新闻驱动", 5.0, 0.0
 
-        # 计算全天平均情绪分
-        valid_scores = [n.sentiment_score for n in recent_news]
-        avg_score = sum(valid_scores) / len(valid_scores) if valid_scores else 5.0
+        current_time = datetime.now()
+        weighted_scores = []
+        weights = []
+
+        for n in recent_news:
+            # 处理时区一致性，防止 offset-naive 和 offset-aware 报错
+            news_time = n.fetch_time.replace(tzinfo=None) if n.fetch_time.tzinfo else n.fetch_time
+            delta_hours = max(0.0, (current_time - news_time).total_seconds() / 3600.0)
+
+            # 🌟 核心算法 1：引入半衰期 (Half-life = 6小时)，越旧的新闻权重越低
+            w = math.exp(-math.log(2) / 6.0 * delta_hours)
+            weights.append(w)
+            weighted_scores.append(n.sentiment_score * w)
+
+        sum_w = sum(weights)
+        if sum_w == 0:
+            return "计算异常兜底", 5.0, 0.0
+
+        # 🌟 核心算法 2：计算加权平均情绪得分
+        avg_score = sum(weighted_scores) / sum_w
+
+        # 🌟 核心算法 3：计算情绪加权方差与标准差 (衡量多空分歧度/离散度)
+        variance = sum(w * (n.sentiment_score - avg_score) ** 2 for w, n in zip(weights, recent_news)) / sum_w
+        sentiment_std = math.sqrt(variance)
 
         # 将带有分数和关联板块的新闻整理成硬核报告
         formatted_lines = [f"- [{n.sentiment_score}分] {n.title} (指向板块: {n.related_sector})" for n in recent_news]
+
+        # 🚨 终极风控：系统硬性预警插入
+        if sentiment_std > 2.5:
+            warning_msg = f"⚠️ 【系统量化预警】当前24小时情绪标准差高达 {sentiment_std:.2f}！市场处于极端割裂状态，多空博弈惨烈，随时可能诱发剧烈变盘！"
+            formatted_lines.insert(0, warning_msg)
+
         news_text = "\n".join(formatted_lines)
 
-        return news_text, round(avg_score, 2)
+        return news_text, round(avg_score, 2), round(sentiment_std, 2)
 
     # ----------------------------------------------------------------
     # [中枢枢纽]: 主执行流水线 (Orchestrator)
@@ -210,19 +238,20 @@ class MarketPipeline:
             # 1. 提取量化特征
             quant_context = self._analyze_quantitative_data(db)
 
-            # 2. 提取预处理过的新闻文本和平均分
-            news_text, avg_news_score = self._analyze_qualitative_news(db)
+            # 2. 提取预处理过的新闻文本、平均分和离散度
+            news_text, avg_news_score, sentiment_std = self._analyze_qualitative_news(db)
 
-            logger.info(">>> [Fusion Engine] AI 启动高级共振推理 (不再需要逐条打分)...")
+            logger.info(">>> [Fusion Engine] AI 启动高级共振推理 (加入离散度感知)...")
 
-            # 3. 构建减负后的高级 Prompt
+            # 3. 构建减负后的高级 Prompt (注入离散度参数)
             prompt = ChatPromptTemplate.from_template(
-                """作为顶级买方宏观策略基金经理，请结合以下【量价因子数据】与【已精标的24小时新闻流】，分析核心矛盾与方向。
+                """作为顶级买方宏观策略基金经理，请结合以下【量价因子数据】与【经过时间衰减计算的新闻流】，分析核心矛盾与方向。
 
                 【1. 量价监控面板 (硬逻辑底座)】
                 - 系统测算大势: {quant_regime}
                 - 趋势支撑度: {trend_score} | 动量强度: {momentum_score}
-                - 过去24小时新闻均分: {avg_news_score}/10 (低于5分说明宏观情绪悲观，高于5分说明利好较多)
+                - 过去24小时情绪均分: {avg_news_score}/10 (平滑衰减后)
+                - 🚨 情绪离散度/分歧度 (Standard Deviation): {sentiment_std} (若>2.5代表多空极其割裂，必须收缩战线防御！)
                 - 当前资金最青睐的风格: {leading_style}
 
                 【2. 过去24小时核心新闻与打分流水】
@@ -230,7 +259,7 @@ class MarketPipeline:
 
                 【深度推理指令】
                 1. 你的任务是基于上述资料输出最终的 macro_theme, top_sector, market_regime 和 reasoning。
-                2. 交叉验证：高分新闻（利好）是否得到了量价动能的印证？
+                2. 交叉验证：高分新闻（利好）是否得到了量价动能的印证？若情绪分歧极大({sentiment_std}>2.5)，必须在推理中体现对冲思维。
                 3. 风险兜底：如果量价显示为 Risk-Off 或者 均分极低，必须在推荐板块中优先配置“纯债”或“黄金”。
                 4. 请严格按照 JSON 格式输出。
                 """
@@ -243,12 +272,10 @@ class MarketPipeline:
                 "trend_score": quant_context.get('trend_score', '0/0'),
                 "momentum_score": quant_context.get('momentum_score', '0/0'),
                 "avg_news_score": avg_news_score,
+                "sentiment_std": sentiment_std,
                 "leading_style": quant_context.get('leading_style', '未知'),
                 "news_content": news_text
             })
-
-            # 🌟 注意：这里彻底删除了原来遍历新闻并 db.commit() 回写的逻辑！
-            # 因为新闻在入库时就已经由小 Agent (NewsScoringAgent) 标好分了。
 
             logger.info(f">>> [MarketPipeline] 分析闭环完成！研判状态: {analysis_result.market_regime}")
             logger.info(f"    - 宏观主题: {analysis_result.macro_theme}")

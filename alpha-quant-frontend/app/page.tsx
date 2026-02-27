@@ -243,7 +243,6 @@ export default function AlphaQuantDashboard() {
     setChatHistory([]);
   };
 
-  // 🌟 核心重构：专业量化主副图（双 Grid）配置
   const getChartOptions = () => {
     if (!chartData || !chartData.xAxis_dates || chartData.xAxis_dates.length === 0) return {};
 
@@ -260,7 +259,6 @@ export default function AlphaQuantDashboard() {
         top: 0,
         textStyle: { fontSize: 12, color: '#64748b' }
       },
-      // 🌟 切割为两个区域：主图占 50%，副图占 25%
       grid: [
         { left: '6%', right: '4%', top: '12%', height: '50%', containLabel: true },
         { left: '6%', right: '4%', top: '68%', height: '25%', containLabel: true }
@@ -270,39 +268,39 @@ export default function AlphaQuantDashboard() {
           type: 'category',
           data: chartData.xAxis_dates,
           gridIndex: 0,
-          axisLabel: { show: false }, // 隐藏主图的时间轴，让副图显示即可
+          axisLabel: { show: false },
           axisTick: { show: false },
           axisLine: { lineStyle: { color: '#e2e8f0' } }
         },
         {
           type: 'category',
           data: chartData.xAxis_dates,
-          gridIndex: 1, // 副图的时间轴
+          gridIndex: 1,
           axisLine: { lineStyle: { color: '#e2e8f0' } },
           axisLabel: { color: '#64748b', fontSize: 10 }
         }
       ],
       yAxis: [
-        { // 主图 Y 轴 (MA20)
+        {
           type: 'value',
           gridIndex: 0,
-          scale: true, // 🌟 绝对关键：开启自适应缩放，不再从 0 绘制，解决一条直线的 Bug
+          scale: true,
           splitLine: { lineStyle: { type: 'dashed', color: '#f1f5f9' } },
           axisLabel: { color: '#64748b', fontSize: 10 }
         },
-        { // 副图 Y 轴左侧 (MACD)
+        {
           type: 'value',
           gridIndex: 1,
           scale: true,
           splitLine: { show: false },
           axisLabel: { color: '#64748b', fontSize: 10 }
         },
-        { // 副图 Y 轴右侧 (RSI)
+        {
           type: 'value',
           gridIndex: 1,
           position: 'right',
           min: 0,
-          max: 100, // RSI 严格限制在 0-100 区间
+          max: 100,
           splitLine: { show: false },
           axisLabel: { show: false }
         }
@@ -324,9 +322,8 @@ export default function AlphaQuantDashboard() {
           type: 'bar',
           data: chartData.series.macd,
           xAxisIndex: 1,
-          yAxisIndex: 1, // 挂载到副图
+          yAxisIndex: 1,
           itemStyle: {
-            // A股习惯：红涨绿跌
             color: (params: any) => params.value > 0 ? '#ef4444' : '#10b981',
             borderRadius: [2, 2, 0, 0]
           }
@@ -336,7 +333,7 @@ export default function AlphaQuantDashboard() {
           type: 'line',
           data: chartData.series.rsi,
           xAxisIndex: 1,
-          yAxisIndex: 2, // 挂载到副图的右侧固定轴
+          yAxisIndex: 2,
           smooth: true,
           itemStyle: { color: '#f59e0b' },
           lineStyle: { width: 1.5, type: 'dashed' },
@@ -583,7 +580,6 @@ export default function AlphaQuantDashboard() {
               </div>
             </div>
 
-            {/* 🌟 增加 overflow-hidden 防止容器意外溢出 */}
             <div className="h-[350px] w-full overflow-hidden">
               {chartData ? (
                 <ReactECharts option={getChartOptions()} style={{ height: '100%', width: '100%' }} />
@@ -663,30 +659,56 @@ export default function AlphaQuantDashboard() {
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-
-                  <div className="bg-white/80 p-5 rounded-2xl border border-emerald-50 shadow-sm flex flex-col h-full max-h-[350px]">
+                  {/* 🌟 修改点 1：拉高卡片 max-height 以适配更多的策略内容 */}
+                  <div className="bg-white/80 p-5 rounded-2xl border border-emerald-50 shadow-sm flex flex-col h-full max-h-[480px]">
                     <h3 className="text-sm font-bold text-emerald-700 mb-3 flex items-center gap-2"><PieChart className="w-4 h-4"/> 建议调仓指令</h3>
-                    <div className="space-y-4 overflow-y-auto scrollbar-thin pr-2">
-                      {advisorData.actions?.existing_adjustments?.map((adj: any, i: number) => (
-                        <div key={i} className="flex flex-col border-b border-slate-50 pb-3 gap-1.5">
-                          <div className="flex justify-between items-center">
-                            <span className="text-sm font-bold text-slate-700 flex items-center">
-                              {adj.name}
-                              {renderFundClassBadge(adj.name)}
-                              <span className="text-xs font-normal text-slate-400 ml-1">({adj.code || "未知"})</span>
-                            </span>
-                            <span className={`px-2.5 py-1 rounded text-[10px] font-black tracking-wider ml-2 ${
-                              adj.action === 'HOLD' ? 'bg-slate-100 text-slate-600' :
-                              adj.action === 'REDUCE' || adj.action === 'CLEAR' ? 'bg-rose-100 text-rose-600' : 'bg-emerald-100 text-emerald-600'
-                            }`}>
-                              {adj.action}
-                            </span>
+                    <div className="space-y-5 overflow-y-auto scrollbar-thin pr-2 pb-4">
+                      {advisorData.actions?.existing_adjustments?.map((adj: any, i: number) => {
+                        const actionText = (adj.action || 'HOLD').toUpperCase();
+                        const isSell = actionText === 'REDUCE' || actionText === 'CLEAR' || actionText === 'SELL';
+
+                        return (
+                          <div key={i} className="flex flex-col border-b border-slate-100 pb-4 gap-2">
+                            {/* 第一行：基金名称、标签、持仓操作 */}
+                            <div className="flex justify-between items-center">
+                              <span className="text-sm font-bold text-slate-700 flex items-center">
+                                {adj.name}
+                                {renderFundClassBadge(adj.name)}
+                                <span className="text-[10px] font-normal text-slate-400 ml-1">({adj.code || "未知"})</span>
+                              </span>
+                              <span className={`px-2.5 py-1 rounded text-[10px] font-black tracking-wider ml-2 uppercase ${
+                                actionText === 'HOLD' ? 'bg-slate-100 text-slate-600' :
+                                isSell ? 'bg-rose-100 text-rose-600' : 'bg-emerald-100 text-emerald-600'
+                              }`}>
+                                {actionText}
+                              </span>
+                            </div>
+
+                            {/* 🌟 修改点 2：垂直布局，带有底色的高级感操作细节区 */}
+                            {(adj.action_details || adj.holding_advice) && (
+                                <div className="flex flex-col gap-2 mt-1 mb-1">
+                                  {adj.action_details && (
+                                      <div className="flex items-start gap-2 text-xs font-bold text-indigo-700 bg-indigo-50/80 px-3 py-2 rounded-lg border border-indigo-100/50">
+                                        <span className="mt-[1px]">🎯</span>
+                                        <span>{adj.action_details}</span>
+                                      </div>
+                                  )}
+                                  {adj.holding_advice && (
+                                      <div className="flex items-start gap-2 text-xs font-bold text-amber-700 bg-amber-50/80 px-3 py-2 rounded-lg border border-amber-100/50">
+                                        <span className="mt-[1px]">⏳</span>
+                                        <span>{adj.holding_advice}</span>
+                                      </div>
+                                  )}
+                                </div>
+                            )}
+
+                            {/* 🌟 修改点 3：深度分析区块，扩大 padding 和行高，增加圆角背景 */}
+                            <div className="text-xs text-slate-600 leading-relaxed bg-slate-50 p-3 rounded-xl border border-slate-100">
+                              {adj.reasoning || "AI暂未提供详细调仓说明，建议保持关注。"}
+                            </div>
                           </div>
-                          <p className="text-xs text-slate-500 leading-relaxed bg-slate-50/50 p-2 rounded-lg border border-slate-100">
-                            {adj.reasoning || "AI暂未提供详细调仓说明，建议保持关注。"}
-                          </p>
-                        </div>
-                      ))}
+                        );
+                      })}
                       {(!advisorData.actions?.existing_adjustments || advisorData.actions.existing_adjustments.length === 0) && (
                         <div className="flex items-center justify-center h-full pt-8">
                           <span className="text-xs text-slate-400">当前您的账户无持仓，无需调仓。</span>
@@ -695,7 +717,8 @@ export default function AlphaQuantDashboard() {
                     </div>
                   </div>
 
-                  <div className="bg-gradient-to-br from-violet-500 to-fuchsia-500 p-5 rounded-2xl shadow-md text-white flex flex-col h-full max-h-[350px] overflow-hidden">
+                  {/* 🌟 修改点 4：对应拉高推荐卡片高度 */}
+                  <div className="bg-gradient-to-br from-violet-500 to-fuchsia-500 p-5 rounded-2xl shadow-md text-white flex flex-col h-full max-h-[480px] overflow-hidden">
                     <h3 className="text-sm font-bold text-white/90 mb-3 flex-shrink-0 flex items-center justify-between">
                       <span>✨ 优质组合推荐</span>
                       <span className="text-[10px] font-normal opacity-70 bg-black/20 px-2 py-0.5 rounded-full">横向滑动查看 ➔</span>
@@ -714,6 +737,32 @@ export default function AlphaQuantDashboard() {
                               <p className="text-[10px] opacity-80 text-amber-300 font-bold">建议持有 {rec.holding_period_months} 个月</p>
                             </div>
                           </div>
+
+                          {/* 🌟 修改点 5：渲染新增的组合角色与 Alpha 来源标签 */}
+                          {(rec.position_role || rec.alpha_source) && (
+                            <div className="flex flex-wrap gap-2 mb-2">
+                              {rec.position_role && (
+                                <span className="bg-fuchsia-600/60 border border-fuchsia-400/50 text-white px-2 py-1 rounded-md text-[10px] font-bold tracking-wide">
+                                  🧩 {rec.position_role}
+                                </span>
+                              )}
+                              {rec.alpha_source && (
+                                <span className="bg-violet-600/60 border border-violet-400/50 text-white px-2 py-1 rounded-md text-[10px] font-bold tracking-wide">
+                                  ⚡ {rec.alpha_source}
+                                </span>
+                              )}
+                            </div>
+                          )}
+
+                          {/* 🌟 修改点 6：渲染强约束买入建仓策略标签 */}
+                          {rec.buy_strategy && (
+                              <div className="mb-2">
+                                <span className="inline-block bg-white/20 border border-white/30 text-white px-2 py-1 rounded-md text-[10px] font-bold">
+                                  🛒 策略: {rec.buy_strategy}
+                                </span>
+                              </div>
+                          )}
+
                           <div className="text-xs bg-black/20 p-2.5 rounded-lg leading-relaxed flex-grow overflow-y-auto scrollbar-none opacity-90 text-white/90 shadow-inner">
                             {rec.reasoning}
                           </div>

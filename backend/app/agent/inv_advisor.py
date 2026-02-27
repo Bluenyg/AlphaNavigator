@@ -6,6 +6,7 @@ import logging
 import pandas as pd
 import numpy as np
 import akshare as ak
+from datetime import datetime, timezone
 from typing import List, Dict, Any, TypedDict
 from pydantic import BaseModel, Field
 
@@ -14,7 +15,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, START, END
 
 from sqlalchemy.orm import Session
-from ..models import PortfolioItem, User, InvestmentAdvice, MarketIndicator, FundQuantFeature
+from ..models import PortfolioItem, User, InvestmentAdvice, MarketIndicator, FundQuantFeature, TransactionLog
 from ..database import SessionLocal
 from ..config import settings
 
@@ -25,31 +26,32 @@ logger = logging.getLogger("AdvisorEngine_LangGraph_Production")
 # 1. Pydantic 结构化输出模型 (约束各个 Agent 的输出)
 # ==========================================
 
-class FactorWeights(BaseModel):
-    w_sharpe: float = Field(..., description="夏普比率权重 (0.0 - 1.0)")
-    w_drawdown: float = Field(..., description="最大回撤权重 (0.0 - 1.0)")
-    w_momentum: float = Field(..., description="动量权重 (0.0 - 1.0)")
-
+# ❌ 删除了 FactorWeights，剥离大模型对核心数学权重的计算权限，改用底层代码硬算。
 
 class SectorAgentOutput(BaseModel):
     top_sectors: List[str] = Field(..., description="当前最看好的 2-3 个 A股/债券 细分板块名称。")
-    # 🌟 优化：禁止 AI 输出数学公式和系统术语
     sector_logic: str = Field(...,
                               description="面向高净值客户的宏观分析。用极具专业感、流畅的投研语言解释逻辑。严禁在文本中暴露权重数字(如0.7)、'量化状态为'、'因子'等生硬术语，字数控制在150字内。")
-    factor_weights: FactorWeights = Field(...,
-                                          description="根据当前宏观周期动态生成的因子权重矩阵，三个权重相加应为 1.0。该数据不会展示给客户。")
+    # 🌟 factor_weights 字段已移除，由底层系统在状态流转时注入
 
 
+# 🌟 核心升级 1：重构基金推荐模型，强迫输出胜率逻辑与组合角色
 class FundRecommendation(BaseModel):
     code: str = Field(..., description="基金代码")
     name: str = Field(..., description="基金名称")
-    trend_prediction: str = Field(...,
-                                  description="长线胜率预测：结合真实的夏普比率、最大回撤等量化特征，给出风险收益比评估。")
+
+    position_role: str = Field(...,
+                               description="该基金在组合中扮演的角色，仅限：进攻核心 / 卫星增强 / 防守底仓 / 轮动交易仓")
+    alpha_source: str = Field(...,
+                              description="明确未来收益的 Alpha 核心驱动力，如：行业景气度提升 / 风格切换 / 利率下行 / 政策驱动 / 估值修复")
+
+    buy_strategy: str = Field(...,
+                              description="具体的买入建仓姿势。必须依赖当前市场状态(Regime)给出建议。例如：'市场顶部震荡，切勿追高，等趋势确认再买' 或 '防守期，可直接买入底仓'。控制在15个字以内。")
     holding_period_months: int = Field(...,
-                                       description="建议持有的时间（以月为单位，严格依据资产类别调整，如固收短、权益长）。")
-    # 🌟 优化：要求使用“人文+金融”语言
+                                       description="建议持有的时间（以月为单位，严格依据资产类别与当前所处周期调整）。")
+
     reasoning: str = Field(...,
-                           description="推荐理由：把冰冷的量化数据翻译成客户听得懂的投资优势，例如‘该资产在极端行情下抗跌能力极强’。严禁暴露后台系统指令。")
+                           description="深度推荐理由：把量化数据翻译成投资优势，且必须说明这只基金是如何填补或对冲客户当前持仓缺口的。")
 
 
 class FundAgentOutput(BaseModel):
@@ -60,9 +62,12 @@ class PortfolioAdjustment(BaseModel):
     code: str = Field(..., description="已有持仓的基金代码")
     name: str = Field(..., description="已有持仓的基金名称")
     action: str = Field(..., description="操作指令，仅限 'HOLD'(持有), 'REDUCE'(减仓), 'CLEAR'(清仓), 'ADD'(加仓) 之一")
-    # 🌟 优化：内化交易规则，转化为专业投顾建议
+    action_details: str = Field(...,
+                                description="具体操作建议：例如'逢高减仓50%'、'清仓落袋为安'、'锁仓等待7天惩罚期结束'、'逢低分批定投'")
+    holding_advice: str = Field(...,
+                                description="预期持有周期：例如'建议继续持有1-3个月'、'长期底仓锁死1年以上'、'短期规避手续费'")
     reasoning: str = Field(...,
-                           description="调仓理由：必须将A/C类的摩擦成本内化为专业的理财建议（如‘由于您持有的是适合长线的份额，短期赎回存在较高的摩擦成本，建议耐心持有’），绝对禁止出现‘该基金为场外A类’、‘根据平台红线’等机器人般的复读机话语。")
+                           description="调仓理由：必须是一段极具深度的专业分析，包含基本面剖析和交易摩擦考量。")
 
 
 class PortfolioAgentOutput(BaseModel):
@@ -86,7 +91,7 @@ class AdvisorState(TypedDict):
 
     top_sectors: List[str]
     sector_logic: str
-    factor_weights: Dict[str, float]
+    factor_weights: Dict[str, float]  # 🌟 现在由 _get_dynamic_factor_weights 确定性推导
 
     candidate_funds: List[Dict[str, Any]]
     recommended_funds: List[dict]
@@ -96,18 +101,19 @@ class AdvisorState(TypedDict):
 
 
 # ==========================================
-# 3. 本地量化资产筛选器
+# 3. 本地量化资产筛选器 (🌟 引入截面 Z-Score 与均值回归惩罚)
 # ==========================================
 class FundQuantScreener:
-    def get_candidates_for_sectors(self, sectors: List[str], is_risk_off: bool, weights: Dict[str, float]) -> List[
+    def get_candidates_for_sectors(self, sectors: List[str], quant_regime: str, weights: Dict[str, float]) -> List[
         Dict]:
         db: Session = SessionLocal()
         candidates = []
+        is_risk_off = "Risk-Off" in quant_regime or "Bearish" in quant_regime or "震荡" in quant_regime
+
         try:
             w_s = weights.get("w_sharpe", 0.4)
             w_d = weights.get("w_drawdown", 0.4)
             w_m = weights.get("w_momentum", 0.2)
-            logger.info(f">>> [Quant Engine] 正在应用 LLM 动态因子权重: Sharpe={w_s}, Drawdown={w_d}, Momentum={w_m}")
 
             for sector in sectors:
                 if is_risk_off and "债" not in sector and "货币" not in sector and "红利" not in sector:
@@ -123,19 +129,48 @@ class FundQuantScreener:
                 if not matched_records:
                     continue
 
-                def calc_dynamic_score(record):
-                    sharpe = float(record.sharpe_ratio or 0.0)
-                    drawdown = float(record.max_drawdown or 0.0)
-                    momentum = float(record.momentum_1y or 0.0)
-                    return (w_s * sharpe) + (w_d * drawdown) + (w_m * momentum)
+                # ✅ 1. 将数据转换为 Pandas DataFrame 进行截面向量化运算
+                df = pd.DataFrame([{
+                    "id": r.id,
+                    "code": r.fund_code,
+                    "name": r.fund_name,
+                    "type": r.fund_type,
+                    "sharpe_ratio": float(r.sharpe_ratio or 0.0),
+                    "max_drawdown": float(r.max_drawdown or 0.0),  # 通常存为负数，如-0.15。越大(越接近0)越好
+                    "momentum_1y": float(r.momentum_1y or 0.0),
+                    "raw_obj": r
+                } for r in matched_records])
 
-                sorted_records = sorted(matched_records, key=calc_dynamic_score, reverse=True)
+                if df.empty or len(df) < 2:
+                    continue
 
-                # 🌟 修复同质化推荐：增加一个简单的防重机制，确保同一家基金公司的产品只入选一个
+                # ✅ 2. 横截面 Z-Score 标准化 (消除量纲差异)
+                for col in ['sharpe_ratio', 'max_drawdown', 'momentum_1y']:
+                    col_std = df[col].std()
+                    if col_std == 0 or pd.isna(col_std):
+                        df[f'{col}_z'] = 0.0
+                    else:
+                        df[f'{col}_z'] = (df[col] - df[col].mean()) / col_std
+
+                # ✅ 3. A股特色风控：震荡市均值回归惩罚 (反拥挤度)
+                if "震荡" in quant_regime or "Oscillating" in quant_regime:
+                    # 如果某基金动量超越同类 1.5 个标准差，说明极其拥挤，反而强扣分 (-1.0倍惩罚)
+                    df['momentum_1y_z'] = np.where(df['momentum_1y_z'] > 1.5, df['momentum_1y_z'] * -1.0,
+                                                   df['momentum_1y_z'])
+
+                # ✅ 4. 动态加权总分
+                df['dynamic_score'] = (w_s * df['sharpe_ratio_z']) + (w_d * df['max_drawdown_z']) + (
+                            w_m * df['momentum_1y_z'])
+
+                # 按动态得分降序排列
+                sorted_df = df.sort_values(by='dynamic_score', ascending=False)
+
                 seen_companies = set()
                 top_funds = []
-                for r in sorted_records:
-                    company_name = r.fund_name[:2]  # 简单提取前两个字作为基金公司特征，如“银华”、“工银”
+
+                for _, row_data in sorted_df.iterrows():
+                    r = row_data['raw_obj']
+                    company_name = r.fund_name[:2]
                     if company_name not in seen_companies:
                         top_funds.append(r)
                         seen_companies.add(company_name)
@@ -155,14 +190,15 @@ class FundQuantScreener:
                         "baseline_holding_months": 6 if is_bond else 18
                     })
 
-            # 如果候选不足，用宽基兜底
-            if len(candidates) < 3:
+            # 🌟 修复候选池不足的问题：放宽到至少 4 只候选
+            if len(candidates) < 4:
                 fallback_keyword = "债" if is_risk_off else "指数"
                 fallback_records = db.query(FundQuantFeature).filter(
                     FundQuantFeature.fund_type.like(f"%{fallback_keyword}%")
                 ).all()
 
                 if fallback_records:
+                    # 兜底查询简单排序，因为不需要太精细的对冲
                     sorted_fb = sorted(fallback_records,
                                        key=lambda r: (w_s * float(r.sharpe_ratio or 0.0)) + (
                                                w_d * float(r.max_drawdown or 0.0)) + (
@@ -182,10 +218,10 @@ class FundQuantScreener:
                                 "baseline_holding_months": 6 if is_bond else 18
                             })
                             seen_fb.add(company_name)
-                        if len(candidates) >= 4:
+                        if len(candidates) >= 5:  # 提供5只让它挑3只
                             break
 
-            return candidates[:4]
+            return candidates[:5]
 
         except Exception as e:
             logger.error(f"查询离线量化特征库失败: {e}")
@@ -202,7 +238,7 @@ class AdvisorEngine:
         self.screener = FundQuantScreener()
         self.llm = ChatOpenAI(
             model=settings.MODEL_NAME,
-            temperature=0.3,  # 稍微调高至 0.3，让行文更有温度和变化
+            temperature=0.3,
             api_key=settings.OPENAI_API_KEY,
             base_url=settings.OPENAI_BASE_URL,
             max_retries=3
@@ -225,24 +261,77 @@ class AdvisorEngine:
 
         return workflow.compile()
 
+    # 🌟 核心升级：独立抽离确定性因子权重推导函数 (剥离大模型幻觉)
+    def _get_dynamic_factor_weights(self, quant_metrics: dict) -> dict:
+        """基于系统状态矩阵的确定性数学推导"""
+        w_s, w_d, w_m = 0.4, 0.4, 0.2  # 初始基准 (均衡模型)
+
+        regime = quant_metrics.get("quant_regime", "Unknown")
+        high_vol_warnings = quant_metrics.get("high_volatility_warnings", 0)
+
+        # 1. 波动率风险溢价转移
+        if high_vol_warnings >= 2:
+            w_d += 0.3;
+            w_s -= 0.15;
+            w_m -= 0.15
+        elif high_vol_warnings == 1:
+            w_d += 0.15;
+            w_s -= 0.05;
+            w_m -= 0.10
+
+        # 2. 动能溢价
+        if "Bullish" in regime and high_vol_warnings < 2:
+            w_m += 0.25;
+            w_s -= 0.15;
+            w_d -= 0.10
+
+        # 3. 震荡防守
+        if "Oscillating" in regime or "震荡" in regime or "Bearish" in regime:
+            w_m -= 0.15;
+            w_s += 0.15
+
+        # 归一化 Softmax 变体 (保证三者之和为 1 且绝不为负)
+        w_s = max(0.01, w_s);
+        w_d = max(0.01, w_d);
+        w_m = max(0.01, w_m)
+        total = w_s + w_d + w_m
+
+        weights = {
+            "w_sharpe": round(w_s / total, 3),
+            "w_drawdown": round(w_d / total, 3),
+            "w_momentum": round(w_m / total, 3)
+        }
+        logger.info(f">>> [Math Engine] 系统根据当前量化面板动态推演出的选基因子权重: {weights}")
+        return weights
+
     # --- Node 1: 宏观分析师 ---
     def _node_sector_analyst(self, state: AdvisorState):
         news = state['market_data'].get('news_analysis', {}).get('top_sector', '无明显热点')
+        quant_metrics = state['market_data'].get('quant_metrics', {})
 
+        # ✅ 用纯代码接管权重分配
+        factor_weights = self._get_dynamic_factor_weights(quant_metrics)
+
+        # 🌟 核心优化：彻底戒断“散户看新闻炒股”思维，注入机构级“交叉验证”投研框架
         prompt = ChatPromptTemplate.from_template(
-            """作为顶尖宏观量化策略师，请一步步思考：
-            第一步：分析【市场量化状态】，生成最符合当前周期的因子权重矩阵 (w_sharpe, w_drawdown, w_momentum)，三者相加必须为 1.0。
-            第二步：寻找基本面与资金面共振的板块。
+            """你是一位拥有20年穿越牛熊经验的顶尖宏观量化策略师。
+            你的核心投研哲学是【交叉验证】：绝不盲从单一的新闻政策热点，而是将“宏观叙事(News)”、“真实资金面(Money Flow)”与“量化周期(Regime)”相互印证，推导出真正具备坚实底盘的主攻板块。
 
-            【市场量化状态】: {quant_regime}
-            【真实板块交投热度】:
+            【当前市场量化状态 (Regime)】: {quant_regime}
+            【今日真实资金交投热度 (量化打分)】:
             {sector_scores}
-            【宏观新闻热点】: {news}
+            【媒体/新闻驱动的政策热点】: {news}
 
-            🚨 客户表达红线：
-            1. 在 `sector_logic` 中，你必须用高情商、专业的财富顾问口吻向客户汇报。
-            2. 严禁暴露你的内部计算逻辑（绝对不能出现类似“因子权重归一化”、“0.7+0.1=1.0”、“状态为Unknown”这种机器人语言）。
-            3. 如果状态不明朗，请用“当前市场正处于震荡整固期”来优雅地替代。
+            请严格按照以下逻辑进行深度推演：
+            【去伪存真，寻找共振 (极其重要)】：
+                - 🛑 严禁“听风就是雨”：绝不能仅仅因为【媒体热点】提到了某个板块（如贵金属、新能源），就直接将其作为主攻方向！新闻往往带有情绪煽动和滞后性。
+                - 🔬 交叉验证机制：你必须将【媒体热点】与【今日真实资金交投热度】进行比对。如果新闻吹捧某赛道，但资金交投榜单上毫无踪影，说明是“散户接盘的虚假繁荣”，请坚决舍弃！
+                - 🎯 锁定主攻：只有当一个板块既符合当前的【市场量化状态】(如防守期优先红利/纯债，多头期优选科技/成长)，又在【真实资金交投】中排名前列，或者具备极强的对冲价值时，才可将其选入 `top_sectors`（2-3个）。
+
+            🚨 客户研报表达红线（`sector_logic` 字段输出要求）：
+            1. 展现机构级投研深度：向客户汇报时，必须解释这是“剥离了市场短期噪音后，基于底层资金面与宏观周期的共振”得出的结论，体现出极强的客观性。
+            2. 语感克制、高级：严禁使用“因为新闻报道了XXX所以我们看好XXX”这种业余话术。请使用“穿透短期情绪博弈，真实资金正加速向XXX靠拢”、“契合当前XXX的宏观象限”等私人银行高级话术。
+            3. 严禁暴露内部因子计算公式或“状态为Unknown”等生硬机器语言，字数控制在150字内。
             """
         )
         agent = prompt | self.llm.with_structured_output(SectorAgentOutput)
@@ -252,42 +341,53 @@ class AdvisorEngine:
             "news": news
         })
 
-        weights = {
-            "w_sharpe": result.factor_weights.w_sharpe,
-            "w_drawdown": result.factor_weights.w_drawdown,
-            "w_momentum": result.factor_weights.w_momentum
+        # 返回推演出的逻辑，并将代码计算出的权重汇入状态图
+        return {
+            "top_sectors": result.top_sectors,
+            "sector_logic": result.sector_logic,
+            "factor_weights": factor_weights
         }
-
-        return {"top_sectors": result.top_sectors, "sector_logic": result.sector_logic, "factor_weights": weights}
 
     # --- Node 2: 桥接层 ---
     def _node_fund_screener(self, state: AdvisorState):
-        is_risk_off = "Risk-Off" in state['quant_regime'] or "Bearish" in state['quant_regime']
-        candidates = self.screener.get_candidates_for_sectors(state['top_sectors'], is_risk_off,
-                                                              state['factor_weights'])
+        # ✅ 改为传入量化状态(quant_regime)，让筛选器能对震荡市实施拥挤度惩罚
+        candidates = self.screener.get_candidates_for_sectors(
+            state['top_sectors'],
+            state['quant_regime'],
+            state['factor_weights']
+        )
         return {"candidate_funds": candidates}
 
-    # --- Node 3: 基金研究员 ---
+    # --- Node 3: 基金研究员 (🌟 晋升为 FOF 组合架构师) ---
     def _node_fund_selector(self, state: AdvisorState):
         if not state['candidate_funds']:
             return {"recommended_funds": []}
 
+        # 🌟 核心修复：增加【强制编队】纪律，必须凑齐 3 只角色互补的基金！
         prompt = ChatPromptTemplate.from_template(
-            """你是一位资深的量化 FOF 基金经理，请基于系统筛选出的标的，为客户输出具有说服力的推荐信。
+            """你是一位顶尖的量化 FOF 基金经理，正在构建投资组合。
+            请基于以下数据，为客户输出高度专业、能创造超额收益(Alpha)的开仓建议。
 
+            【当前市场量化状态 (Regime)】: {quant_regime}
             【宏观配置逻辑】: {sector_logic}
+            【客户当前真实持仓】: {portfolio}
             【系统预选的顶尖基金池】: 
             {candidates}
 
-            🚨 客户表达红线：
-            1. 【翻译数据】：把冰冷的量化指标翻译成客户关心的投资利益。比如最大回撤小，你要说“它在市场大跌时展现出了极强的防御韧性”。
-            2. 【展现差异】：如果你推荐了多只基金，请在 reasoning 中强调它们各自不同的定位和特色，不要把两只基金写得一模一样。
-            3. 【隐蔽后台】：绝不要提及“系统为你筛选”、“动态因子模型”等后台词汇，表现得像这是你经过深度调研得出的结论。
+            🚨 投资行为生成铁律：
+            1. 【强制编队】：你必须从预选池中挑选出 **3只** 基金构成一个攻守兼备的完整组合！绝对不能只推荐 1 只！
+            2. 【角色互补】：这 3 只基金的 `position_role`（组合角色）必须是互补的（例如：包含进攻核心、卫星增强、防守底仓等搭配），不能全部同质化。
+            3. 【组合层仓位约束】：审视客户的【真实持仓】，如果客户在某个赛道（如科技、医药）暴露过高，你在推荐这几只基金时，必须明确说明它们是如何【平衡或对冲现有组合风险的】。严防单赛道满仓暴雷！
+            4. 【市场状态与买入策略】：`buy_strategy` 必须严格依赖当前【Regime】。如果是高动量基金但在震荡期或顶部特征，严禁建议满仓，必须写明“等趋势确认再买”或“极小仓位定投”。
+            5. 【收益来源】：在 `alpha_source` 字段精准指出未来能赚钱的逻辑（行业景气度提升 / 风格切换 / 利率下行 / 政策驱动 / 估值修复）。
+            6. 【翻译数据】：把冰冷数据翻译成投资利益，绝不提及“系统为你筛选”等后台词汇。
             """
         )
         agent = prompt | self.llm.with_structured_output(FundAgentOutput)
         result: FundAgentOutput = agent.invoke({
+            "quant_regime": state['quant_regime'],
             "sector_logic": state['sector_logic'],
+            "portfolio": json.dumps(state['portfolio'], ensure_ascii=False),
             "candidates": json.dumps(state['candidate_funds'], ensure_ascii=False)
         })
 
@@ -296,32 +396,32 @@ class AdvisorEngine:
     # --- Node 4: 投资组合经理 ---
     def _node_portfolio_manager(self, state: AdvisorState):
         prompt = ChatPromptTemplate.from_template(
-            """你是一位顶尖的私人银行财富管家，正在为高净值客户（仅在支付宝等场外平台交易）审视持仓。
+            """你是一位顶尖的私人银行财富管家，正在为仅在场外平台交易的高净值客户审视持仓。
 
             【当前市场量化状态】: {quant_regime}
             【目标资产配置比例模型】: {target_allocation}
-            【建议买入的新资产】: {new_funds}
-            【用户当前真实持仓】: {portfolio}
+            【今日全市场板块交投热度】: {sector_scores}
 
-            🚨 【内化规则与表达红线】 (必须强制执行，这是你的专业度所在)：
-            你心里清楚A类基金(长线, 1.5%惩罚赎回费)和C类基金(短线波段, 需满7天)的交易底线规则，但**你在对客户说话时，绝对不能像复读机一样背出规则原话！**
+            🚨 【用户当前真实持仓 (已包含 holding_days 持仓天数)】: 
+            {portfolio}
 
-            错误表达❌：“该基金为场外A类份额(名称含联接A)，根据平台红线，持有期未满1年不建议卖出，以免产生高额赎回费。”
-            正确表达✅：“这只基金目前作为我们底仓的核心资产，考虑到其长线定位，目前继续持有可以避免不必要的短期摩擦成本，静待估值修复。”
+            🚨 【场外资金管理生死红线】：
+            1. 识别 C类资产 (波段, 免申购费)：如果持仓名称含"C"且 `holding_days` < 7天：
+               - 铁律：无论行情多恶劣，绝对禁止给出 'REDUCE', 'CLEAR' 或 'SELL' 指令！必须给出 'HOLD'，并在 `action_details` 明确指出“静待7天免手续费期满”。
+            2. 识别 A类资产 (长线, 有申购费)：如果名称含"A"或不含C。
+               - 铁律：长线配置。如果 `holding_days` 较短，尽量建议 'HOLD'。
 
-            错误表达❌：“识别到C类资产，允许敏捷清仓...”
-            正确表达✅：“目前该板块动能有所减弱，得益于该基金灵活的费率结构，建议您可以获利了结，落袋为安。”
-
-            指令约束：
-            1. overall_strategy 提供宏观维度的账户调整思路。
-            2. reasoning 必须采用上述【正确表达】的高情商、专业的服务口吻。
+            【输出要求】
+            - action_details 必须极其具体（如“逢高减仓50%”）。
+            - holding_advice 给出时间预期（如“建议再持有1-3个月”）。
+            - reasoning 必须是一段极具深度的专业分析，必须包含：第一层【基本面与景气度挖掘】，第二层【交易摩擦考量】。严禁只谈费率不谈基本面！
             """
         )
         agent = prompt | self.llm.with_structured_output(PortfolioAgentOutput)
         result: PortfolioAgentOutput = agent.invoke({
             "quant_regime": state['quant_regime'],
             "target_allocation": json.dumps(state['target_allocation'], ensure_ascii=False),
-            "new_funds": json.dumps(state['recommended_funds'], ensure_ascii=False),
+            "sector_scores": state['sector_quant_scores'],
             "portfolio": json.dumps(state['portfolio'], ensure_ascii=False)
         })
 
@@ -374,9 +474,36 @@ class AdvisorEngine:
 
             portfolio_items = db.query(PortfolioItem).filter(PortfolioItem.user_id == user.id,
                                                              PortfolioItem.shares > 0).all()
-            portfolio_data = [{"code": p.fund_code, "name": p.fund_name, "shares": p.shares} for p in portfolio_items]
 
-            # 🌟 修复 Unknown 问题：如果量化系统返回 Unknown，用更优雅的词汇替代，防止大模型懵掉
+            portfolio_data = []
+            for p in portfolio_items:
+                last_buy = db.query(TransactionLog).filter(
+                    TransactionLog.user_id == user.id,
+                    TransactionLog.fund_code == p.fund_code,
+                    TransactionLog.action == 'BUY'
+                ).order_by(TransactionLog.timestamp.desc()).first()
+
+                holding_days = 0
+                if last_buy and last_buy.timestamp:
+                    try:
+                        now = datetime.now(last_buy.timestamp.tzinfo) if last_buy.timestamp.tzinfo else datetime.now()
+                        holding_days = (now - last_buy.timestamp).days
+                    except:
+                        holding_days = (datetime.now() - last_buy.timestamp).days
+                elif p.updated_at:
+                    try:
+                        now = datetime.now(p.updated_at.tzinfo) if p.updated_at.tzinfo else datetime.now()
+                        holding_days = (now - p.updated_at).days
+                    except:
+                        holding_days = (datetime.now() - p.updated_at).days
+
+                portfolio_data.append({
+                    "code": p.fund_code,
+                    "name": p.fund_name,
+                    "shares": p.shares,
+                    "holding_days": holding_days
+                })
+
             raw_regime = market_data.get('quant_metrics', {}).get('quant_regime', 'Unknown')
             quant_regime = "震荡筑底(趋势不明朗)" if raw_regime == "Unknown" else raw_regime
 

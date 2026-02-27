@@ -106,42 +106,50 @@ class AkshareService:
     def get_index_daily(symbol: str = "sh000300", lookback_days: int = 100, max_retries: int = 3) -> pd.DataFrame:
         """
         获取指数日线数据并规范化列名
-        🌟 核心升级：废弃不稳定的新浪旧接口，采用极其稳定的东财 index_zh_a_hist 接口
+        🌟 终极修复：引入【新浪/东财】多源自动容灾切换机制，彻底解决单一接口被封断开连接的问题
         """
         attempt = 0
-
-        # 东方财富的新接口只需要 6 位纯数字代码，不需要 'sh' 或 'sz' 前缀
-        # 例如将 'sh000300' 转换为 '000300'，'sz399006' 转换为 '399006'
         pure_code = symbol[-6:] if len(symbol) > 6 else symbol
 
         while attempt < max_retries:
             try:
-                logger.info(f"正在获取指数数据: {symbol} (纯代码: {pure_code}, 尝试 {attempt + 1}/{max_retries})...")
+                logger.info(f"正在获取指数数据: {symbol} (尝试 {attempt + 1}/{max_retries})...")
+                # 增加基础休眠，错开高频并发期
+                time.sleep(1.0)
 
-                # 微小的休眠对服务器更友好
-                time.sleep(0.5)
+                df = None
 
-                # 🚀 替换为东财最稳定的指数历史行情接口
-                df = ak.index_zh_a_hist(symbol=pure_code, period="daily")
+                # -----------------------------------------
+                # 策略 A：优先尝试新浪接口 (极度稳定，抗高并发防封锁)
+                # -----------------------------------------
+                try:
+                    # 新浪接口要求带有 sh/sz 前缀，如 sz399006
+                    df = ak.stock_zh_index_daily(symbol=symbol)
+                    if df is not None and not df.empty:
+                        # 新浪接口原生列名就是 date, open, high, low, close, volume
+                        pass
+                except Exception as e1:
+                    logger.debug(f"新浪接口获取失败，准备切换至东方财富: {e1}")
+                    df = None
+
+                # -----------------------------------------
+                # 策略 B：如果新浪挂了，自动降级到东方财富历史接口
+                # -----------------------------------------
+                if df is None or df.empty:
+                    df = ak.index_zh_a_hist(symbol=pure_code, period="daily")
+                    if df is not None and not df.empty:
+                        # 东方财富接口需要映射中文列名
+                        col_map = {
+                            "日期": "date", "开盘": "open", "收盘": "close",
+                            "最高": "high", "最低": "low", "成交量": "volume"
+                        }
+                        df.rename(columns=col_map, inplace=True)
 
                 if df is None or df.empty:
-                    logger.warning(f"指数 {symbol} 数据为空，将进行下一次尝试。")
-                    attempt += 1
-                    continue
+                    raise ConnectionError("所有数据源均无响应或被封禁")
 
-                # 截取我们需要的天数
+                # ============ 统一的数据清洗与截取流程 ============
                 df = df.tail(lookback_days).copy()
-
-                # 映射东财接口的中文列名
-                col_map = {
-                    "日期": "date",
-                    "开盘": "open",
-                    "收盘": "close",
-                    "最高": "high",
-                    "最低": "low",
-                    "成交量": "volume"
-                }
-                df.rename(columns=col_map, inplace=True)
 
                 if 'date' in df.columns:
                     df['date'] = pd.to_datetime(df['date'])
@@ -156,8 +164,8 @@ class AkshareService:
 
             except Exception as e:
                 attempt += 1
-                logger.warning(f"获取指数 {symbol} 遇到网络阻断 ({e})，等待 {attempt * 2} 秒后重试...")
-                time.sleep(attempt * 2)  # 指数级退避
+                logger.warning(f"获取指数 {symbol} 遇到网络阻断 ({e})，等待 {attempt * 3} 秒后重试...")
+                time.sleep(attempt * 3)  # 被封禁时拉长等待时间
 
         logger.error(f"!!! 致命错误：获取指数 {symbol} 数据在 {max_retries} 次尝试后依然失败。")
         return pd.DataFrame()

@@ -32,26 +32,6 @@ class FundDataPipeline:
         self.batch_size = batch_size
         self.db = SessionLocal()
 
-    # ==========================================
-    # 🌟 新增：幂等性校验 (判断今日是否已更新)
-    # ==========================================
-    def check_updated_today(self) -> bool:
-        """检查数据库中最新的一条量化数据是否是今天更新的"""
-        try:
-            # 按最后更新时间倒序，取最新的一条记录
-            latest_record = self.db.query(FundQuantFeature).order_by(FundQuantFeature.updated_at.desc()).first()
-            if not latest_record or not latest_record.updated_at:
-                return False
-
-            # 提取记录的日期与今天的日期进行比对
-            latest_date = latest_record.updated_at.date()
-            today_date = datetime.now().date()
-
-            return latest_date == today_date
-        except Exception as e:
-            logger.error(f"检查数据库最新日期时发生异常: {e}")
-            return False
-
     def load_fund_list(self) -> pd.DataFrame:
         """从本地 CSV 加载全市场基金列表，并进行深度清洗瘦身"""
         if not os.path.exists(self.csv_path):
@@ -124,27 +104,61 @@ class FundDataPipeline:
             "annual_return": metrics.get("annual_return", 0.0)
         }
 
-    # 🌟 修改 run 方法，加入 force 参数，并在最开始做拦截
+    # 🌟 核心重构：实现精准的“断点续传”与“增量过滤”
+    def get_remaining_funds(self, df_all: pd.DataFrame) -> pd.DataFrame:
+        """比对数据库，返回今天尚未更新的基金 DataFrame"""
+        try:
+            today = datetime.now().date()
+            # 从数据库中拉取所有基金的代码和最后更新时间
+            records = self.db.query(FundQuantFeature.fund_code, FundQuantFeature.updated_at).all()
+
+            # 挑出今天已经成功更新过的基金代码
+            updated_today_codes = set()
+            for r in records:
+                if r.updated_at and r.updated_at.date() == today:
+                    updated_today_codes.add(r.fund_code)
+
+            # Pandas 魔法：从全列表中剔除已经更新过的
+            # 注意统一转换为 6 位字符串进行精确匹配
+            df_all['safe_code'] = df_all['code'].astype(str).str.zfill(6)
+            df_remaining = df_all[~df_all['safe_code'].isin(updated_today_codes)].copy()
+
+            return df_remaining
+        except Exception as e:
+            logger.error(f"比对增量更新名单时发生异常: {e}")
+            return df_all  # 如果比对失败，安全起见返回全量列表
+
     def run(self, max_workers: int = 5, force: bool = False):
         """
         执行流水线主循环
         :param max_workers: 并发线程数
-        :param force: 是否强制执行 (无视今天是否已经更新过)
+        :param force: 是否强制全量重跑 (无视今天是否已经更新过)
         """
         logger.info(f"========== 🚀 启动公募基金离线量化计算 (并发模式, 线程数:{max_workers}) ==========")
-
-        # 🌟 核心拦截逻辑：判断今日是否已拉取
-        if not force and self.check_updated_today():
-            logger.info("✅ 检测到今日 (T日) 的量化特征已成功写入数据库，跳过本次网络请求，保护接口额度！")
-            logger.info("========== 🏁 离线多线程流水线提前结束 ==========")
-            self.db.close()
-            return
-
         start_time = time.time()
 
         df_funds = self.load_fund_list()
         if df_funds.empty:
+            self.db.close()
             return
+
+        original_count = len(df_funds)
+
+        # 🌟 应用增量/断点续传逻辑
+        if not force:
+            df_funds = self.get_remaining_funds(df_funds)
+            remaining_count = len(df_funds)
+
+            if remaining_count == 0:
+                logger.info(f"✅ 检测到今日 (T日) 的 {original_count} 只基金量化特征已全部拉取完毕，无需重复执行。")
+                logger.info("========== 🏁 离线多线程流水线提前结束 ==========")
+                self.db.close()
+                return
+            elif remaining_count < original_count:
+                logger.info(
+                    f"🔄 发现今日已成功更新 {original_count - remaining_count} 只，尚有 {remaining_count} 只待更新。启动【断点续传】模式...")
+        else:
+            logger.info("⚠️ 收到强制执行指令，将无视历史记录进行【全量重跑】。")
 
         total_funds = len(df_funds)
         success_count = 0
@@ -172,7 +186,8 @@ class FundDataPipeline:
                     data_dict = future.result()
 
                     if data_dict:
-                        existing_record = self.db.query(FundQuantFeature).filter(FundQuantFeature.fund_code == data_dict['fund_code']).first()
+                        existing_record = self.db.query(FundQuantFeature).filter(
+                            FundQuantFeature.fund_code == data_dict['fund_code']).first()
 
                         if existing_record:
                             existing_record.fund_name = data_dict['fund_name']
@@ -192,7 +207,8 @@ class FundDataPipeline:
 
                     current_total = success_count + error_count
                     if current_total % 20 == 0:
-                        logger.info(f"--- 进度: [{current_total}/{total_funds}] --- 成功: {success_count}, 失败: {error_count}")
+                        logger.info(
+                            f"--- 进度: [{current_total}/{total_funds}] --- 成功: {success_count}, 失败: {error_count}")
 
                     if success_count > 0 and success_count % self.batch_size == 0:
                         self.db.commit()
@@ -215,10 +231,9 @@ class FundDataPipeline:
         elapsed_time = (time.time() - start_time) / 60
         logger.info("========== 🏁 离线多线程流水线运行完毕 ==========")
         logger.info(f"总耗时: {elapsed_time:.2f} 分钟.")
-        logger.info(f"总处理数: {total_funds} | 成功入库: {success_count} | 失败/跳过: {error_count}")
+        logger.info(f"本次处理数: {total_funds} | 成功入库: {success_count} | 失败/跳过: {error_count}")
 
 
 if __name__ == "__main__":
     pipeline = FundDataPipeline(csv_filename="all_funds_list.csv", batch_size=50)
-    # 如果手动运行该脚本，可以传 force=True 强制覆盖今天的数据
     pipeline.run(max_workers=5, force=False)
