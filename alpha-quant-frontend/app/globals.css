@@ -1,0 +1,43 @@
+@import "tailwindcss";
+
+:root {
+  /* 使用浅色背景适配微拟物设计 */
+  --background: #f8fafc; /* Tailwind 的 slate-50，非常柔和的浅灰白 */
+  --foreground: #1e293b; /* Tailwind 的 slate-800，用于正文文字 */
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+/* ==========================================
+ * 核心修改：删除了 @media (prefers-color-scheme: dark)
+ * 强制应用使用明亮主题，防止用户的操作系统是深色模式时导致 UI 撕裂
+ * ========================================== */
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  /* 优化中文字体渲染 */
+  font-family: var(--font-sans), "PingFang SC", "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 隐藏部分浏览器的默认滚动条，适配我们的 scrollbar-thin 插件 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 10px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
